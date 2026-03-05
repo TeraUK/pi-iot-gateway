@@ -4,8 +4,8 @@
 #
 # Creates a veth pair and attaches one end to the Zeek container for
 # OVS traffic mirroring. Run this AFTER docker compose up.
-#
-# Usage: sudo ./scripts/attach-zeek-mirror.sh
+# Must be copied to /usr/local/bin
+# Usage: sudo /usr/local/bin/attach-zeek-mirror.sh
 #
 
 set -euo pipefail

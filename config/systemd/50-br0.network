@@ -1,3 +1,5 @@
+#Must be copied to /etc/systemd/network
+
 [Match]
 Name=br0
 

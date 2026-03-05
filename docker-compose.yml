@@ -27,7 +27,7 @@ services:
   # AdGuard Home (DNS Filtering)
   # =============================================
   adguard:
-    image: adguardteam/adguardhome:latest
+    image: adguard/adguardhome:latest
     container_name: adguard-home
     restart: unless-stopped
     ports:
@@ -60,19 +60,19 @@ services:
     image: zeek/zeek:lts
     container_name: zeek
     restart: unless-stopped
+    entrypoint: ["/opt/zeek-entrypoint/entrypoint.sh"]
     # Zeek runs in live capture mode on the mirror interface (zeek-eth1),
-    # which is attached by the post-startup script (attach-zeek-mirror.sh).
+    # which is attached by the post-startup script (attach-zeek-mirror.sh) which is handled by systemd.
     # On first start, before the mirror interface exists, Zeek will fail
     # and restart — this is expected. Once the script runs, Zeek will
-    # find the interface and begin capturing.
-    command: >
-      zeek -i zeek-eth1 -C
-      /usr/local/zeek/share/zeek/site/local.zeek
+    # find the interface and begin capturing. 
+    # entrypoint.sh keeps zeek alive until the mirror interface has been attached, then starts zeek. 
     volumes:
       # Zeek writes logs here; the ML pipeline reads from here.
       - zeek-logs:/opt/zeek-logs
       # Custom Zeek scripts
       - ./zeek/site/local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
+      - ./zeek/entrypoint.sh:/opt/zeek-entrypoint/entrypoint.sh:ro
     environment:
       - ZEEK_LOG_DIR=/opt/zeek-logs
     # Override the default log directory.

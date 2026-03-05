@@ -1,3 +1,5 @@
+#Must be copied to /etc/systemd/system
+
 [Unit]
 Description=Attach OVS mirror port to Zeek container
 After=docker.service ovs-vswitchd.service
@@ -10,7 +12,7 @@ RemainAfterExit=yes
 # Wait for the Zeek container to be running.
 # It may take a few seconds after docker.service starts.
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do docker inspect --format "{{.State.Running}}" zeek 2>/dev/null | grep -q true && exit 0; sleep 2; done; echo "Zeek container not running after 60s"; exit 1'
-ExecStart=/home/<tera>/iot-gateway/scripts/attach-zeek-mirror.sh
+ExecStart=/usr/local/bin/attach-zeek-mirror.sh
 
 # Clean up the netns symlink on stop.
 ExecStop=/bin/bash -c 'rm -f /var/run/netns/zeek; ovs-vsctl --if-exists del-port br0 zeek-veth-h; ip link delete zeek-veth-h 2>/dev/null || true'
