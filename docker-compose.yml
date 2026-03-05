@@ -43,7 +43,8 @@ services:
       - ./adguard/conf:/opt/adguardhome/conf
       - ./adguard/work:/opt/adguardhome/work
     networks:
-      - gateway-net
+      - gateway-net:
+          ipv4_address: 172.20.0.53
     deploy:
       resources:
         limits:
@@ -121,6 +122,10 @@ services:
 networks:
   gateway-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
     # This is an internal Docker bridge network for container-to-container
     # communication. It is NOT connected to the OVS bridge. Containers that
     # need to reach the host or be reached by IoT clients use port mappings.
