@@ -10,6 +10,12 @@
 # behaviour can indicate compromise or misconfiguration.
 @load base/protocols/ntp
 
+# SSH and FTP analysis - IoT devices should rarely use these protocols.
+# If an SSH or FTP connection appears in the logs, it is a strong
+# anomaly signal worth investigating (detection scripts willflag this).
+@load base/protocols/ssh
+@load base/protocols/ftp
+
 # Connection content tracking - logs byte counts, packet counts,
 # and connection duration. These become features for the ML pipeline.
 @load base/protocols/conn/contents
@@ -44,6 +50,20 @@ redef Log::default_rotation_interval = 1 hr;
 
 # Reduce noise: suppress the packet filter log and loaded-scripts log.
 @load base/misc/version
+
+# ---- SSL Certificate Validation ----
+# Flags expired, self-signed, and otherwise invalid certificates.
+# IoT devices often have poor certificate hygiene, so this may be
+# noisy at first. Useful for spotting MITM attempts or devices
+# communicating with suspicious servers.
+@load policy/protocols/ssl/validate-certs
+
+# ---- DNS Query Case Preservation ----
+# Preserves the original capitalisation of DNS query names in dns.log
+# rather than lowercasing everything. Some malware encodes data in the
+# case pattern of DNS labels (a technique used in DNS tunnelling).
+# Having the original case available makes that detectable.
+@load policy/protocols/dns/log-original-query-case
 
 # ---- Ryu REST API Integration ----
 # Load the ActiveHTTP utility so it is available when I add detection
