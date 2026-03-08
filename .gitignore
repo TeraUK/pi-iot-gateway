@@ -30,6 +30,9 @@ models/checkpoints/
 adguard/data/
 adguard/work/
 
+#AdGuard Home Configuration File
+adguard/conf/AdGuardHome.yaml
+
 # OS and editor files
 .DS_Store
 Thumbs.db

@@ -5,8 +5,8 @@ http:
   address: 0.0.0.0:80
   session_ttl: 720h
 users:
-  - name: tera
-    password: $2a$10$kJDdXaIS5pmFufSPzbUQCOmGoW7pODj/oAX4kLUQcozRZSFEZd6z2
+  - name:
+    password:
 auth_attempts: 5
 block_auth_min: 15
 http_proxy: ""
