@@ -89,8 +89,6 @@ FLOWS=$(ovs-ofctl dump-flows br0 2>/dev/null || echo "")
 if [ -z "$FLOWS" ]; then
     fail "Could not dump OVS flows"
 else
-    echo "DEBUG: FLOWS variable length: ${#FLOWS}"
-    echo "$FLOWS" | head -5
     FLOW_COUNT=$(echo "$FLOWS" | grep -c "cookie=" || echo "0")
     pass "OVS has $FLOW_COUNT flow rules installed"
 
