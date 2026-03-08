@@ -89,13 +89,13 @@ class GatewayPolicyController(ControllerBase):
     def get_status(self, req, **kwargs):
         """Return the current policy engine status."""
         body = json.dumps(self.app.get_status(), indent=2)
-        return Response(content_type="application/json", body=body)
+        return Response(content_type="application/json", charset="utf-8", body=body)
 
     @route("policy", BASE_URL + "/devices", methods=["GET"])
     def get_devices(self, req, **kwargs):
         """Return the list of known devices (MACs seen on the WiFi port)."""
         body = json.dumps(self.app.get_known_devices(), indent=2)
-        return Response(content_type="application/json", body=body)
+        return Response(content_type="application/json", charset="utf-8", body=body)
 
     @route("policy", BASE_URL + "/isolate", methods=["POST"])
     def isolate_device(self, req, **kwargs):
@@ -105,14 +105,15 @@ class GatewayPolicyController(ControllerBase):
             mac = body.get("mac", "").lower()
             reason = body.get("reason") or "API request (no reason provided)"
         except (ValueError, AttributeError):
-            return Response(status=400, body="Invalid JSON")
+            return Response(status=400, charset="utf-8", body="Invalid JSON")
 
         if not mac:
-            return Response(status=400, body='Missing "mac" field')
+            return Response(status=400, charset="utf-8", body='Missing "mac" field')
 
         result = self.app.isolate_device(mac, reason)
         return Response(
             content_type="application/json",
+            charset="utf-8",
             body=json.dumps(result, indent=2),
         )
 
@@ -123,14 +124,15 @@ class GatewayPolicyController(ControllerBase):
             body = json.loads(req.body)
             mac = body.get("mac", "").lower()
         except (ValueError, AttributeError):
-            return Response(status=400, body="Invalid JSON")
+            return Response(status=400, charset="utf-8", body="Invalid JSON")
 
         if not mac:
-            return Response(status=400, body='Missing "mac" field')
+            return Response(status=400, charset="utf-8", body='Missing "mac" field')
 
         result = self.app.release_device(mac)
         return Response(
             content_type="application/json",
+            charset="utf-8",
             body=json.dumps(result, indent=2),
         )
 
