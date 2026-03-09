@@ -57,7 +57,7 @@ attach_mirror() {
     echo "$VETH_HOST added to OVS bridge br0."
 
     # Configure OVS mirroring
-    ovs-vsctl --if-exists -- --id=@m get mirror zeek-mirror -- remove bridge br0 mirrors @m 2>/dev/null || true
+    ovs-vsctl -- --id=@m get mirror zeek-mirror -- remove bridge br0 mirrors @m 2>/dev/null || true
     ovs-vsctl \
         -- --id=@p get port "$VETH_HOST" \
         -- --id=@m create mirror name=zeek-mirror select-all=true output-port=@p \
@@ -68,7 +68,7 @@ attach_mirror() {
 
 cleanup() {
     echo "Cleaning up..."
-    rm -f /var/run/netns/zeek
+    rm -f /var/run/netns/zeek # Remove the symlink to the container's network namespace
     ovs-vsctl --if-exists del-port br0 "$VETH_HOST"
     ip link delete "$VETH_HOST" 2>/dev/null || true
     exit 0
