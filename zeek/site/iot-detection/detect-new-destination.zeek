@@ -93,7 +93,7 @@ event connection_established(c: connection)
         return;
 
     # Skip traffic to the gateway and within the IoT subnet.
-    if ( dst == to_addr(gateway_ip) )
+    if ( dst == gateway_ip )
         return;
     if ( dst in iot_subnet )
         return;
