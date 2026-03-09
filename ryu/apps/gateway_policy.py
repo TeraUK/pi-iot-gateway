@@ -1,27 +1,38 @@
 """
 IoT Security Gateway - SDN Policy Application
-Phase 2: Micro-segmentation (POL-01) + Essential Services (POL-05)
+Phase 3: Per-Device Destination Allowlists (POL-02)
 
-This application replaces the learning switch with a security-focused
-policy engine. It installs proactive OpenFlow rules that enforce:
+Builds on Phase 2 (micro-segmentation + essential services) by adding
+per-device destination allowlists. Each IoT device can be assigned a
+profile that restricts its WAN access to a set of approved IP ranges
+and domain names.
 
-  1. Default deny - all traffic is dropped unless explicitly allowed
-  2. Micro-segmentation - IoT devices cannot communicate with each other
-  3. Essential services - DHCP, DNS, and NTP are universally permitted
-  4. General WAN access - devices can reach the internet via the gateway
-     (this will be replaced by per-device allowlists in Phase 3)
+The app operates in one of two modes:
+  - "learning": General WAN access rules (priority 50) remain active
+    for all devices. This is the baseline collection period where I
+    use Zeek logs to profile device traffic and build allowlists. No
+    traffic is blocked beyond what Phase 2 already blocks.
+  - "enforcing": For devices that have an allowlist profile, the
+    general WAN rules are bypassed. Only traffic to allowed
+    destinations passes. Devices without profiles still get general
+    WAN access (so I can add profiles incrementally without breaking
+    un-profiled devices).
 
-The app discovers OVS port numbers dynamically so it does not depend
-on hardcoded port numbers.
+Device profiles are loaded from a JSON config file that is mounted
+into the container. The config can be reloaded at runtime via the
+REST API without restarting Ryu.
 
-Flow Rule Priority Scheme:
-    0   - Table-miss (send to controller, safety net)
-    1   - Default deny (drop everything not explicitly allowed)
-    50  - General WAN access (temporary, replaced in Phase 3)
-    150 - Anti-lateral-movement (block IoT-to-IoT via gateway routing)
-    200 - Essential services (DHCP, DNS, NTP, ARP)
-    500 - Per-device allowlists (Phase 3, not yet implemented)
-    65535 - Dynamic isolation (Phase 4, not yet implemented)
+Flow Rule Priority Scheme (updated for Phase 3):
+    0     - Table-miss (send to controller, safety net)
+    1     - Default deny (drop everything not explicitly allowed)
+    50    - General WAN access (active for un-profiled devices)
+    100   - Per-device WAN intercept (send to controller for evaluation)
+            and per-device inbound deny (block un-allowed return traffic)
+    150   - Anti-lateral-movement (block IoT-to-IoT via gateway routing)
+    200   - Essential services (DHCP, DNS, NTP, ARP)
+    500   - Per-device allowlist entries (reactive, installed on first
+            matching packet, with idle timeout)
+    65535 - Dynamic isolation (Phase 4)
 """
 
 from ryu.base import app_manager
@@ -34,12 +45,16 @@ from ryu.lib.packet import packet, ethernet, arp, ipv4
 from ryu.app.wsgi import WSGIApplication, ControllerBase, route
 import json
 import logging
+import os
+import struct
+import socket
+import time
 from webob import Response
 from datetime import datetime, timezone
 
 LOG = logging.getLogger(__name__)
 
-# ── Configuration ──────────────────────────────────────────────
+# -- Configuration ----------------------------------------------------------
 # Adjust these to match the network environment.
 
 GATEWAY_IP = "192.168.50.1"
@@ -51,39 +66,84 @@ IOT_SUBNET_MASK = "255.255.255.0"
 # runtime by matching this name in the port description reply.
 WIFI_INTERFACE = "wlp3s0"
 
-# ── Priority Levels ───────────────────────────────────────────
+# Path to the device profiles config file inside the container.
+# This is mounted from the host via docker-compose.
+DEVICE_PROFILES_PATH = os.environ.get(
+    "DEVICE_PROFILES_PATH",
+    "/opt/ryu/config/device_profiles.json",
+)
+
+# -- Priority Levels --------------------------------------------------------
 # Higher number = higher priority = matched first in OVS.
 
 PRI_TABLE_MISS = 0          # Safety net: send unmatched to controller
 PRI_DEFAULT_DENY = 1        # Drop everything not explicitly allowed
-PRI_WAN_ACCESS = 50         # General internet access (Phase 2 only)
+PRI_WAN_ACCESS = 50         # General internet access (un-profiled devices)
+PRI_DEVICE_INTERCEPT = 100  # Per-device WAN intercept/deny (profiled devices)
 PRI_ANTI_LATERAL = 150      # Block IoT-to-IoT via gateway routing
 PRI_ESSENTIAL = 200         # DHCP, DNS, NTP, ARP
-PRI_DEVICE_ALLOW = 500      # Per-device allowlists (Phase 3)
+PRI_DEVICE_ALLOW = 500      # Per-device allowlist entries (reactive)
 PRI_ISOLATE = 65535         # Dynamic device isolation (Phase 4)
 
+# Default idle timeout for reactive allowlist flow rules (seconds).
+# When no matching traffic flows for this duration, OVS removes the
+# rule automatically. The next packet triggers a new controller
+# evaluation. This keeps the flow table clean and allows the DNS
+# cache to stay current.
+DEFAULT_IDLE_TIMEOUT = 300
 
-# ── REST API Configuration ────────────────────────────────────
+# -- REST API Configuration -------------------------------------------------
 
-POLICY_API_INSTANCE = "gateway_policy_app" #dictionary key for GatewayPolicy
+POLICY_API_INSTANCE = "gateway_policy_app"
 BASE_URL = "/policy"
 
-# GatewayPolicyController = REST API CLASS. Standard web controller that handles http requests.
-# Exposes 4 endpoints: 
-# GET /policy/status returns the current state of the engine (is the switch connected, how many rules, how many devices)
-# GET /policy/devices returns every MAC address that's been seen on the WiFi port
-# POST /policy/isolate takes a MAC address in a JSON body and installs drop rules to quarantine that device
-# POST /policy/release removes the quarantine rules for a device
+
+# -- Helper: CIDR matching --------------------------------------------------
+
+def ip_to_int(ip_str):
+    """Convert dotted-quad IP string to a 32-bit integer."""
+    return struct.unpack("!I", socket.inet_aton(ip_str))[0]
+
+
+def cidr_contains(cidr_str, ip_str):
+    """Check whether ip_str falls within the CIDR range cidr_str."""
+    if "/" in cidr_str:
+        network, prefix_len = cidr_str.split("/")
+        prefix_len = int(prefix_len)
+    else:
+        network = cidr_str
+        prefix_len = 32
+
+    mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
+    return (ip_to_int(network) & mask) == (ip_to_int(ip_str) & mask)
+
+
+# -- REST API Controller ----------------------------------------------------
+# Exposes endpoints for policy status, device management, allowlist
+# management, and DNS cache updates.
+#
+# Phase 2 endpoints (unchanged):
+#   GET  /policy/status        - engine state
+#   GET  /policy/devices       - known MACs on the WiFi port
+#   POST /policy/isolate       - quarantine a device by MAC
+#   POST /policy/release       - remove quarantine
+#
+# Phase 3 endpoints (new):
+#   GET  /policy/allowlists            - current device profiles and mode
+#   POST /policy/allowlists/reload     - reload profiles from config file
+#   POST /policy/allowlists/mode       - switch between learning/enforcing
+#   POST /policy/dns-cache             - update domain-to-IP mappings
+#   GET  /policy/dns-cache             - view current DNS cache
+#   GET  /policy/denied-log            - recent denied connection attempts
 
 class GatewayPolicyController(ControllerBase):
     """REST API controller for the gateway policy app."""
 
-    def __init__(self, req, link, data, **config): #Ryu's WGSI framework calls this constructor automatically each time an HTTP request comes in.
-        super().__init__(req, link, data, **config) #A new instance of GatewayPolicyController is created for each request.
-        ##req = http req object. 
-        #link = ryus internals routing info that maps URLS to handler methods.
-        #data = instance of the class GatewayPolicy
-        self.app = data[POLICY_API_INSTANCE] #get an instance of the GatewayPolicy
+    def __init__(self, req, link, data, **config):
+        super().__init__(req, link, data, **config)
+        self.app = data[POLICY_API_INSTANCE]
+
+    # -- Phase 2 endpoints (unchanged) --
 
     @route("policy", BASE_URL + "/status", methods=["GET"])
     def get_status(self, req, **kwargs):
@@ -99,7 +159,7 @@ class GatewayPolicyController(ControllerBase):
 
     @route("policy", BASE_URL + "/isolate", methods=["POST"])
     def isolate_device(self, req, **kwargs):
-        """Isolate a device by MAC address (Phase 4 implementation)."""
+        """Isolate a device by MAC address."""
         try:
             body = json.loads(req.body)
             mac = body.get("mac", "").lower()
@@ -119,7 +179,7 @@ class GatewayPolicyController(ControllerBase):
 
     @route("policy", BASE_URL + "/release", methods=["POST"])
     def release_device(self, req, **kwargs):
-        """Release a previously isolated device (Phase 4 implementation)."""
+        """Release a previously isolated device."""
         try:
             body = json.loads(req.body)
             mac = body.get("mac", "").lower()
@@ -136,41 +196,174 @@ class GatewayPolicyController(ControllerBase):
             body=json.dumps(result, indent=2),
         )
 
+    # -- Phase 3 endpoints (new) --
+
+    @route("policy", BASE_URL + "/allowlists", methods=["GET"])
+    def get_allowlists(self, req, **kwargs):
+        """Return the current device profiles and enforcement mode."""
+        body = json.dumps(self.app.get_allowlists(), indent=2)
+        return Response(content_type="application/json", charset="utf-8", body=body)
+
+    @route("policy", BASE_URL + "/allowlists/reload", methods=["POST"])
+    def reload_allowlists(self, req, **kwargs):
+        """Reload device profiles from the config file on disk."""
+        result = self.app.reload_profiles()
+        return Response(
+            content_type="application/json",
+            charset="utf-8",
+            body=json.dumps(result, indent=2),
+        )
+
+    @route("policy", BASE_URL + "/allowlists/mode", methods=["POST"])
+    def set_mode(self, req, **kwargs):
+        """Switch between learning and enforcing mode."""
+        try:
+            body = json.loads(req.body)
+            mode = body.get("mode", "").lower()
+        except (ValueError, AttributeError):
+            return Response(status=400, charset="utf-8", body="Invalid JSON")
+
+        if mode not in ("learning", "enforcing"):
+            return Response(
+                status=400, charset="utf-8",
+                body='Invalid mode. Must be "learning" or "enforcing".',
+            )
+
+        result = self.app.set_enforcement_mode(mode)
+        return Response(
+            content_type="application/json",
+            charset="utf-8",
+            body=json.dumps(result, indent=2),
+        )
+
+    @route("policy", BASE_URL + "/dns-cache", methods=["POST"])
+    def update_dns_cache(self, req, **kwargs):
+        """
+        Update the DNS cache with domain-to-IP mappings.
+
+        Expected JSON body:
+        {
+            "mappings": {
+                "api.vendor.com": ["203.0.113.50", "203.0.113.51"],
+                "cloud.vendor.com": ["198.51.100.10"]
+            }
+        }
+        """
+        try:
+            body = json.loads(req.body)
+            mappings = body.get("mappings", {})
+        except (ValueError, AttributeError):
+            return Response(status=400, charset="utf-8", body="Invalid JSON")
+
+        if not mappings:
+            return Response(
+                status=400, charset="utf-8",
+                body='Missing or empty "mappings" field',
+            )
+
+        result = self.app.update_dns_cache(mappings)
+        return Response(
+            content_type="application/json",
+            charset="utf-8",
+            body=json.dumps(result, indent=2),
+        )
+
+    @route("policy", BASE_URL + "/dns-cache", methods=["GET"])
+    def get_dns_cache(self, req, **kwargs):
+        """Return the current DNS cache contents."""
+        body = json.dumps(self.app.get_dns_cache(), indent=2)
+        return Response(content_type="application/json", charset="utf-8", body=body)
+
+    @route("policy", BASE_URL + "/denied-log", methods=["GET"])
+    def get_denied_log(self, req, **kwargs):
+        """Return recent denied connection attempts from profiled devices."""
+        body = json.dumps(self.app.get_denied_log(), indent=2)
+        return Response(content_type="application/json", charset="utf-8", body=body)
+
 
 class GatewayPolicy(app_manager.RyuApp):
     """
     SDN policy engine for the IoT security gateway.
 
     On switch connection, this app installs proactive flow rules that
-    implement micro-segmentation and essential service access. It does
-    not use reactive (packet-in driven) rule installation for normal
-    traffic, which keeps the controller out of the fast path.
+    implement micro-segmentation and essential service access (Phase 2),
+    plus per-device allowlist enforcement (Phase 3).
     """
 
-    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION] #tells ryu what open flow protocol is used
-    _CONTEXTS = {"wsgi": WSGIApplication} # tells ryu that this app needs the WGSI web server (ryu only creates one instace of it, and passes it to every app that needs it). Ryu injects it via kwargs["wsgi"] in the constructor, and the controller class is registered against it
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {"wsgi": WSGIApplication}
 
-    def __init__(self, *args, **kwargs): #gathers the positional arguments passed in into a tuple* and a dictionary**
-        super().__init__(*args, **kwargs) #call the app_manager.RyuApp constructor which registers the app with Ryus event system, sets up the OpenFlow protocol handler, initialises the WSGI context, and wires up the event dispatcher that makes the @set_ev_cls decorators work.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
         # Register the REST API.
         wsgi = kwargs["wsgi"]
-        # wsgi.register(controller, data) integrates the customer rest api controller 'GatewayPolicyController' with ryus built in Web Server Gateway Interface (wsgi) 
-        # controller = the rest api controler , data = a dictionary for putting important information in that the controller will need, in this case we use it to pass the policy app
-        # {POLICY_API_INSTANCE: self} == {'gateway_policy_app': GatewayPolicy} - puts the gateway policy in the 'data' variable
-        # ryu will pass 'data' into the controller constructor each time an api request is made
-        wsgi.register(GatewayPolicyController, {POLICY_API_INSTANCE: self}) 
+        wsgi.register(GatewayPolicyController, {POLICY_API_INSTANCE: self})
 
-        # State tracking.
-        self.datapath = None            # The connected OVS switch
-        self.wifi_port = None           # Port number for the WiFi interface
-        self.rules_installed = False    # Whether proactive rules are in place
+        # -- State tracking (Phase 2, unchanged) --
+        self.datapath = None
+        self.wifi_port = None
+        self.rules_installed = False
         self.known_devices = {}         # {mac: {"first_seen": ts, "last_seen": ts}}
         self.isolated_devices = {}      # {mac: {"since": ts, "reason": str}}
-        self.connect_time = None        # When the switch connected
-        self.rule_count = 0             # Number of proactive rules installed
+        self.connect_time = None
+        self.rule_count = 0
 
-    # ── REST API data methods ─────────────────────────────────
+        # -- Phase 3 state --
+        self.device_profiles = {}       # {mac: {name, allowed_domains, allowed_cidrs}}
+        self.enforcement_mode = "learning"
+        self.idle_timeout = DEFAULT_IDLE_TIMEOUT
+        self.dns_cache = {}             # {domain: {"ips": [...], "updated": ts}}
+        self.denied_log = []            # List of recent denied attempts (capped)
+        self.denied_log_max = 500       # Keep the last 500 entries
+        self.active_allowlist_rules = {}  # {mac: set of dest IPs with active rules}
+
+        # Load device profiles from config file on startup.
+        self._load_profiles_from_file()
+
+    # -- Profile loading ----------------------------------------------------
+
+    def _load_profiles_from_file(self):
+        """Load device profiles from the JSON config file."""
+        if not os.path.exists(DEVICE_PROFILES_PATH):
+            LOG.info(
+                "No device profiles config found at %s. "
+                "Starting with empty profiles (all devices get general WAN access).",
+                DEVICE_PROFILES_PATH,
+            )
+            return
+
+        try:
+            with open(DEVICE_PROFILES_PATH, "r") as f:
+                config = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            LOG.error("Failed to load device profiles from %s: %s", DEVICE_PROFILES_PATH, e)
+            return
+
+        # Parse the config.
+        self.enforcement_mode = config.get("mode", "learning")
+        self.idle_timeout = config.get("idle_timeout", DEFAULT_IDLE_TIMEOUT)
+
+        devices = config.get("devices", {})
+        self.device_profiles = {}
+        for mac, profile in devices.items():
+            mac = mac.lower()
+            self.device_profiles[mac] = {
+                "name": profile.get("name", "Unknown"),
+                "manufacturer": profile.get("manufacturer", "Unknown"),
+                "allowed_domains": [d.lower() for d in profile.get("allowed_domains", [])],
+                "allowed_cidrs": profile.get("allowed_cidrs", []),
+            }
+
+        LOG.info(
+            "Loaded %d device profiles from %s. Mode: %s. Idle timeout: %ds.",
+            len(self.device_profiles),
+            DEVICE_PROFILES_PATH,
+            self.enforcement_mode,
+            self.idle_timeout,
+        )
+
+    # -- REST API data methods (Phase 2, unchanged) -------------------------
 
     def get_status(self):
         return {
@@ -185,12 +378,26 @@ class GatewayPolicy(app_manager.RyuApp):
             "connect_time": self.connect_time,
             "gateway_ip": GATEWAY_IP,
             "iot_subnet": f"{IOT_SUBNET}/{IOT_SUBNET_MASK}",
+            # Phase 3 additions to status.
+            "enforcement_mode": self.enforcement_mode,
+            "profiled_devices": len(self.device_profiles),
+            "dns_cache_entries": len(self.dns_cache),
+            "denied_log_size": len(self.denied_log),
         }
 
     def get_known_devices(self):
+        # Augment the device list with profile status.
+        devices = {}
+        for mac, info in self.known_devices.items():
+            entry = dict(info)
+            entry["has_profile"] = mac in self.device_profiles
+            if mac in self.device_profiles:
+                entry["profile_name"] = self.device_profiles[mac]["name"]
+            entry["is_isolated"] = mac in self.isolated_devices
+            devices[mac] = entry
         return {
-            "devices": self.known_devices,
-            "total": len(self.known_devices),
+            "devices": devices,
+            "total": len(devices),
         }
 
     def isolate_device(self, mac, reason="API request (no reason provided)"):
@@ -204,11 +411,9 @@ class GatewayPolicy(app_manager.RyuApp):
         dp = self.datapath
         parser = dp.ofproto_parser
 
-        # Drop all traffic from this MAC address.
         match = parser.OFPMatch(in_port=self.wifi_port, eth_src=mac)
         self._add_flow(dp, PRI_ISOLATE, match, actions=[], tag="isolate")
 
-        # Also drop all traffic TO this MAC address (responses).
         match_to = parser.OFPMatch(in_port=dp.ofproto.OFPP_LOCAL, eth_dst=mac)
         self._add_flow(dp, PRI_ISOLATE, match_to, actions=[], tag="isolate")
 
@@ -230,12 +435,10 @@ class GatewayPolicy(app_manager.RyuApp):
         parser = dp.ofproto_parser
         ofproto = dp.ofproto
 
-        # Delete the isolation rules by sending flow-delete for the specific matches at isolation priority.
-
-        match_from = parser.OFPMatch(in_port=self.wifi_port, eth_src=mac) #release traffic from this MAC address
+        match_from = parser.OFPMatch(in_port=self.wifi_port, eth_src=mac)
         self._delete_flow(dp, PRI_ISOLATE, match_from)
 
-        match_to = parser.OFPMatch(in_port=ofproto.OFPP_LOCAL, eth_dst=mac) #release traffic to this MAC address
+        match_to = parser.OFPMatch(in_port=ofproto.OFPP_LOCAL, eth_dst=mac)
         self._delete_flow(dp, PRI_ISOLATE, match_to)
 
         del self.isolated_devices[mac]
@@ -243,12 +446,337 @@ class GatewayPolicy(app_manager.RyuApp):
 
         return {"success": True, "mac": mac}
 
-    # ── OpenFlow Event Handlers ───────────────────────────────
+    # -- REST API data methods (Phase 3, new) -------------------------------
 
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER) #Step 1 - Called when a switch connects
+    def get_allowlists(self):
+        """Return the current device profiles and mode."""
+        profiles_summary = {}
+        for mac, profile in self.device_profiles.items():
+            profiles_summary[mac] = {
+                "name": profile["name"],
+                "manufacturer": profile["manufacturer"],
+                "allowed_domains": profile["allowed_domains"],
+                "allowed_cidrs": profile["allowed_cidrs"],
+                "active_rules": len(self.active_allowlist_rules.get(mac, set())),
+            }
+        return {
+            "mode": self.enforcement_mode,
+            "idle_timeout": self.idle_timeout,
+            "profiles": profiles_summary,
+            "total_profiles": len(self.device_profiles),
+        }
+
+    def reload_profiles(self):
+        """Reload profiles from the config file and re-apply enforcement rules."""
+        old_mode = self.enforcement_mode
+        old_profiles = set(self.device_profiles.keys())
+
+        self._load_profiles_from_file()
+
+        new_profiles = set(self.device_profiles.keys())
+        added = new_profiles - old_profiles
+        removed = old_profiles - new_profiles
+
+        # If the switch is connected, update the enforcement rules.
+        if self.datapath and self.wifi_port:
+            # Remove intercept rules for devices no longer profiled.
+            for mac in removed:
+                self._remove_device_intercept_rules(mac)
+
+            # If mode changed or profiles changed, re-apply.
+            if self.enforcement_mode == "enforcing":
+                for mac in new_profiles:
+                    self._install_device_intercept_rules(mac)
+            elif old_mode == "enforcing":
+                # Switched from enforcing to learning: remove all intercept rules.
+                for mac in old_profiles:
+                    self._remove_device_intercept_rules(mac)
+
+        return {
+            "success": True,
+            "mode": self.enforcement_mode,
+            "total_profiles": len(self.device_profiles),
+            "added": list(added),
+            "removed": list(removed),
+        }
+
+    def set_enforcement_mode(self, mode):
+        """Switch between learning and enforcing mode."""
+        if mode == self.enforcement_mode:
+            return {"success": True, "mode": mode, "message": "Already in this mode"}
+
+        old_mode = self.enforcement_mode
+        self.enforcement_mode = mode
+
+        if not self.datapath or not self.wifi_port:
+            return {
+                "success": True,
+                "mode": mode,
+                "message": "Mode set. Rules will be applied when the switch reconnects.",
+            }
+
+        if mode == "enforcing":
+            # Install per-device intercept rules for all profiled devices.
+            count = 0
+            for mac in self.device_profiles:
+                self._install_device_intercept_rules(mac)
+                count += 1
+            LOG.info(
+                "Switched to ENFORCING mode. Installed intercept rules for %d devices.",
+                count,
+            )
+            return {
+                "success": True,
+                "mode": mode,
+                "message": f"Enforcing mode active. {count} devices have intercept rules.",
+            }
+        else:
+            # Remove per-device intercept rules (back to learning mode).
+            count = 0
+            for mac in self.device_profiles:
+                self._remove_device_intercept_rules(mac)
+                count += 1
+            # Also remove any reactive allowlist rules that were installed.
+            self._flush_allowlist_rules()
+            LOG.info(
+                "Switched to LEARNING mode. Removed intercept rules for %d devices.",
+                count,
+            )
+            return {
+                "success": True,
+                "mode": mode,
+                "message": f"Learning mode active. {count} devices returned to general WAN access.",
+            }
+
+    def update_dns_cache(self, mappings):
+        """
+        Update the DNS cache with domain-to-IP mappings.
+
+        Called by an external process (e.g., the dns_cache_updater script)
+        that monitors AdGuard/Zeek DNS logs and pushes resolved IPs here.
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        updated = 0
+        for domain, ips in mappings.items():
+            domain = domain.lower()
+            self.dns_cache[domain] = {
+                "ips": list(ips),
+                "updated": ts,
+            }
+            updated += 1
+        LOG.debug("DNS cache updated: %d domains refreshed", updated)
+        return {"success": True, "domains_updated": updated}
+
+    def get_dns_cache(self):
+        """Return the current DNS cache."""
+        return {
+            "cache": self.dns_cache,
+            "total_domains": len(self.dns_cache),
+        }
+
+    def get_denied_log(self):
+        """Return recent denied connection attempts."""
+        return {
+            "entries": self.denied_log[-100:],  # Return last 100
+            "total": len(self.denied_log),
+        }
+
+    # -- Allowlist evaluation -----------------------------------------------
+
+    def _is_destination_allowed(self, mac, dst_ip):
+        """
+        Check whether a profiled device is allowed to reach dst_ip.
+
+        Returns (allowed: bool, reason: str).
+        """
+        profile = self.device_profiles.get(mac)
+        if not profile:
+            return True, "no profile (general WAN access)"
+
+        # Check static CIDR allowlist.
+        for cidr in profile["allowed_cidrs"]:
+            try:
+                if cidr_contains(cidr, dst_ip):
+                    return True, f"matched CIDR {cidr}"
+            except (OSError, ValueError):
+                LOG.warning("Invalid CIDR in profile for %s: %s", mac, cidr)
+                continue
+
+        # Check domain-based allowlist via the DNS cache.
+        for domain in profile["allowed_domains"]:
+            cache_entry = self.dns_cache.get(domain)
+            if cache_entry and dst_ip in cache_entry["ips"]:
+                return True, f"matched domain {domain} (resolved to {dst_ip})"
+
+        return False, f"not in allowlist for {profile['name']}"
+
+    # -- Per-device intercept rules -----------------------------------------
+
+    def _install_device_intercept_rules(self, mac):
+        """
+        Install rules that intercept WAN traffic from a profiled device
+        and send it to the controller for allowlist evaluation.
+
+        Two rules per device:
+          1. Outbound intercept (priority 100): IPv4 from this MAC on
+             the WiFi port is sent to the controller. The controller
+             evaluates it and either installs a priority 500 allow rule
+             or drops the packet.
+          2. Inbound deny (priority 100): IPv4 to this MAC from LOCAL
+             is dropped unless a priority 500 allow rule exists. This
+             prevents return traffic from un-allowed destinations.
+        """
+        if not self.datapath or not self.wifi_port:
+            return
+
+        dp = self.datapath
+        parser = dp.ofproto_parser
+        ofproto = dp.ofproto
+
+        # Outbound: send this device's WAN traffic to the controller.
+        match_out = parser.OFPMatch(
+            in_port=self.wifi_port,
+            eth_src=mac,
+            eth_type=0x0800,
+        )
+        actions_out = [parser.OFPActionOutput(
+            ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER
+        )]
+        self._add_flow(
+            dp, PRI_DEVICE_INTERCEPT, match_out, actions_out,
+            tag=f"intercept-out-{mac[:8]}",
+        )
+
+        # Inbound: drop return traffic to this device by default.
+        # Allowed return traffic will match at priority 500 instead.
+        match_in = parser.OFPMatch(
+            in_port=ofproto.OFPP_LOCAL,
+            eth_dst=mac,
+            eth_type=0x0800,
+        )
+        self._add_flow(
+            dp, PRI_DEVICE_INTERCEPT, match_in, actions=[],
+            tag=f"intercept-in-{mac[:8]}",
+        )
+
+        LOG.info("Installed intercept rules for profiled device %s", mac)
+
+    def _remove_device_intercept_rules(self, mac):
+        """Remove the intercept rules for a device."""
+        if not self.datapath or not self.wifi_port:
+            return
+
+        dp = self.datapath
+        parser = dp.ofproto_parser
+        ofproto = dp.ofproto
+
+        match_out = parser.OFPMatch(
+            in_port=self.wifi_port,
+            eth_src=mac,
+            eth_type=0x0800,
+        )
+        self._delete_flow(dp, PRI_DEVICE_INTERCEPT, match_out)
+
+        match_in = parser.OFPMatch(
+            in_port=ofproto.OFPP_LOCAL,
+            eth_dst=mac,
+            eth_type=0x0800,
+        )
+        self._delete_flow(dp, PRI_DEVICE_INTERCEPT, match_in)
+
+        # Also remove any reactive allowlist rules for this device.
+        self._flush_device_allowlist_rules(mac)
+
+        LOG.info("Removed intercept rules for device %s", mac)
+
+    def _install_allowlist_flow(self, mac, dst_ip):
+        """
+        Install a bidirectional flow rule pair at priority 500 that
+        allows traffic between this device and a specific destination IP.
+        Rules have an idle timeout so they expire when the flow goes quiet.
+        """
+        if not self.datapath or not self.wifi_port:
+            return
+
+        dp = self.datapath
+        parser = dp.ofproto_parser
+        ofproto = dp.ofproto
+        wifi = self.wifi_port
+        local = ofproto.OFPP_LOCAL
+
+        # Outbound: device -> destination via gateway.
+        match_out = parser.OFPMatch(
+            in_port=wifi,
+            eth_src=mac,
+            eth_type=0x0800,
+            ipv4_dst=dst_ip,
+        )
+        actions_out = [parser.OFPActionOutput(local)]
+        self._add_flow(
+            dp, PRI_DEVICE_ALLOW, match_out, actions_out,
+            idle_timeout=self.idle_timeout,
+            tag=f"allow-out-{mac[:8]}->{dst_ip}",
+        )
+
+        # Inbound: destination -> device via gateway.
+        match_in = parser.OFPMatch(
+            in_port=local,
+            eth_dst=mac,
+            eth_type=0x0800,
+            ipv4_src=dst_ip,
+        )
+        actions_in = [parser.OFPActionOutput(wifi)]
+        self._add_flow(
+            dp, PRI_DEVICE_ALLOW, match_in, actions_in,
+            idle_timeout=self.idle_timeout,
+            tag=f"allow-in-{dst_ip}->{mac[:8]}",
+        )
+
+        # Track active rules.
+        if mac not in self.active_allowlist_rules:
+            self.active_allowlist_rules[mac] = set()
+        self.active_allowlist_rules[mac].add(dst_ip)
+
+    def _flush_device_allowlist_rules(self, mac):
+        """Remove all reactive allowlist rules for a specific device."""
+        if not self.datapath:
+            return
+
+        dp = self.datapath
+        parser = dp.ofproto_parser
+        ofproto = dp.ofproto
+
+        active_ips = self.active_allowlist_rules.pop(mac, set())
+        for dst_ip in active_ips:
+            # Delete outbound rule.
+            match_out = parser.OFPMatch(
+                in_port=self.wifi_port,
+                eth_src=mac,
+                eth_type=0x0800,
+                ipv4_dst=dst_ip,
+            )
+            self._delete_flow(dp, PRI_DEVICE_ALLOW, match_out)
+
+            # Delete inbound rule.
+            match_in = parser.OFPMatch(
+                in_port=ofproto.OFPP_LOCAL,
+                eth_dst=mac,
+                eth_type=0x0800,
+                ipv4_src=dst_ip,
+            )
+            self._delete_flow(dp, PRI_DEVICE_ALLOW, match_in)
+
+    def _flush_allowlist_rules(self):
+        """Remove all reactive allowlist rules for all devices."""
+        macs = list(self.active_allowlist_rules.keys())
+        for mac in macs:
+            self._flush_device_allowlist_rules(mac)
+
+    # -- OpenFlow Event Handlers --------------------------------------------
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """Called when a switch connects. Request port descriptions.""" 
-        # Every time OVS restarts or ports are added/removed, port numbers can change so we must ask ovs "tell me about all your ports, their names and numbers")
+        """Called when a switch connects. Request port descriptions."""
         datapath = ev.msg.datapath
         self.datapath = datapath
         self.connect_time = datetime.now(timezone.utc).isoformat()
@@ -257,18 +785,15 @@ class GatewayPolicy(app_manager.RyuApp):
             datapath.id,
         )
 
-        # Request port descriptions so port numbers can be discovered by interface name rather than hardcoding them.
-        
         parser = datapath.ofproto_parser
         req = parser.OFPPortDescStatsRequest(datapath, 0)
         datapath.send_msg(req)
 
-    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER) #Step 2 - Called when OVS responds with the port list
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_reply_handler(self, ev):
         """
-        Called when OVS responds with port descriptions. 
-        Used to discover the port number for the Wi-Fi interface, 
-        then install all the proactive security rules.
+        Called when OVS responds with port descriptions.
+        Discovers the WiFi port number, then installs all proactive rules.
         """
         ports = {}
         for port in ev.msg.body:
@@ -276,7 +801,7 @@ class GatewayPolicy(app_manager.RyuApp):
             if isinstance(name, bytes):
                 name = name.decode("utf-8").rstrip("\x00")
             ports[name] = port.port_no
-            LOG.info("Port discovered: %s = %d", name, port.port_no)
+            LOG.info("  Port discovered: %s = %d", name, port.port_no)
 
         if WIFI_INTERFACE not in ports:
             LOG.error(
@@ -292,28 +817,36 @@ class GatewayPolicy(app_manager.RyuApp):
             "WiFi port resolved: %s = port %d", WIFI_INTERFACE, self.wifi_port
         )
 
+        # Reset tracking state on reconnect.
+        self.active_allowlist_rules = {}
         self._install_all_rules(ev.msg.datapath)
 
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER) #Called when a 'packet' hits the controller
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         """
-        Handle packets that reach the controller (table-miss).
+        Handle packets that reach the controller.
 
-        With proactive rules installed, the only packets that reach
-        here are those not matching any rule (which should be dropped).
-        This handler is used to track device MACs and log dropped traffic for debugging.
+        In Phase 2, packet-ins only came from the table-miss rule and
+        were used for device tracking and debug logging. In Phase 3,
+        packet-ins also come from the per-device intercept rules
+        (priority 100) when a profiled device sends WAN traffic. The
+        handler evaluates the traffic against the device's allowlist
+        and either installs a forwarding rule or drops the packet.
         """
         msg = ev.msg
+        dp = msg.datapath
+        ofproto = dp.ofproto
+        parser = dp.ofproto_parser
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
         if eth is None:
             return
 
-        src_mac = eth.src
-        in_port = msg.match["in_port"] #note. this refers to the switch port
+        src_mac = eth.src.lower()
+        in_port = msg.match["in_port"]
 
-        # Track devices seen on the WiFi port.
+        # Track devices seen on the WiFi port (Phase 2 behaviour).
         if in_port == self.wifi_port and src_mac != "ff:ff:ff:ff:ff:ff":
             now = datetime.now(timezone.utc).isoformat()
             if src_mac not in self.known_devices:
@@ -325,14 +858,73 @@ class GatewayPolicy(app_manager.RyuApp):
             else:
                 self.known_devices[src_mac]["last_seen"] = now
 
-        # Log what is being dropped (at DEBUG level to avoid noise).
+        # Phase 3: evaluate allowlist for profiled devices.
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+
+        if (
+            in_port == self.wifi_port
+            and ip_pkt is not None
+            and self.enforcement_mode == "enforcing"
+            and src_mac in self.device_profiles
+        ):
+            dst_ip = ip_pkt.dst
+            allowed, reason = self._is_destination_allowed(src_mac, dst_ip)
+
+            if allowed:
+                LOG.info(
+                    "ALLOW %s -> %s (%s)",
+                    src_mac, dst_ip, reason,
+                )
+                # Install a bidirectional flow rule for this device+destination.
+                self._install_allowlist_flow(src_mac, dst_ip)
+
+                # Forward the first packet that triggered this evaluation.
+                actions = [parser.OFPActionOutput(ofproto.OFPP_LOCAL)]
+                data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+                out = parser.OFPPacketOut(
+                    datapath=dp,
+                    buffer_id=msg.buffer_id,
+                    in_port=in_port,
+                    actions=actions,
+                    data=data,
+                )
+                dp.send_msg(out)
+            else:
+                # Denied. Log it and let the packet be silently dropped
+                # (we do not send a packet-out, so OVS discards it).
+                LOG.info(
+                    "DENY %s -> %s (%s)",
+                    src_mac, dst_ip, reason,
+                )
+                self._record_denied(src_mac, dst_ip, reason)
+            return
+
+        # Default: log the dropped packet at debug level (Phase 2 behaviour).
         LOG.debug(
             "Packet-in (dropped by default deny): "
             "in_port=%d src=%s dst=%s type=0x%04x",
             in_port, eth.src, eth.dst, eth.ethertype,
         )
 
-    # ── Rule Installation ─────────────────────────────────────
+    def _record_denied(self, mac, dst_ip, reason):
+        """Record a denied connection attempt in the denied log."""
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mac": mac,
+            "dst_ip": dst_ip,
+            "reason": reason,
+        }
+        # Include the device name if known.
+        profile = self.device_profiles.get(mac)
+        if profile:
+            entry["device_name"] = profile["name"]
+
+        self.denied_log.append(entry)
+        # Cap the log size.
+        if len(self.denied_log) > self.denied_log_max:
+            self.denied_log = self.denied_log[-self.denied_log_max:]
+
+    # -- Rule Installation --------------------------------------------------
 
     def _install_all_rules(self, datapath):
         """
@@ -347,47 +939,30 @@ class GatewayPolicy(app_manager.RyuApp):
 
         LOG.info("Installing security policy rules...")
 
-        # ── 1. Table-miss: send to controller (priority 0) ────
-        # Safety net. In practice, the default deny rule at priority 1
-        # catches everything first. This only fires if there is no
-        # other rule at all (e.g., during rule installation).
+        # -- 1. Table-miss: send to controller (priority 0) --
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(
             ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER
         )]
         self._add_flow(datapath, PRI_TABLE_MISS, match, actions, tag="table-miss")
 
-        # ── 2. Default deny: drop everything (priority 1) ─────
-        # POL-01: This is the micro-segmentation backbone. Any traffic
-        # not explicitly permitted by a higher-priority rule is dropped.
-        # Lateral movement between IoT devices is blocked because there
-        # are no rules that forward traffic from the WiFi port back to
-        # itself.
+        # -- 2. Default deny: drop everything (priority 1) --
         match = parser.OFPMatch()
         self._add_flow(datapath, PRI_DEFAULT_DENY, match, actions=[], tag="default-deny")
 
-        # ── 3. ARP: allow in both directions (priority 200) ───
-        # ARP is required for basic L2 operation. Without it, devices
-        # cannot resolve the gateway's MAC address and no IP traffic
-        # works at all. Only ARP between devices and the gateway is
-        # permitted (not device-to-device, since those frames would
-        # need to go from WiFi port back to WiFi port, which no rule
-        # allows).
-        match = parser.OFPMatch(in_port=wifi, eth_type=0x0806) #eth_type=0x0806 = ARP frame
-        actions = [parser.OFPActionOutput(local)] 
+        # -- 3. ARP: allow in both directions (priority 200) --
+        match = parser.OFPMatch(in_port=wifi, eth_type=0x0806)
+        actions = [parser.OFPActionOutput(local)]
         self._add_flow(datapath, PRI_ESSENTIAL, match, actions, tag="arp-to-gw")
 
         match = parser.OFPMatch(in_port=local, eth_type=0x0806)
         actions = [parser.OFPActionOutput(wifi)]
         self._add_flow(datapath, PRI_ESSENTIAL, match, actions, tag="arp-from-gw")
 
-        # ── 4. DHCP: requests and responses (priority 200) ────
-        # POL-05: DHCP is an essential service. Requests (UDP dst 67)
-        # go from devices to the gateway where dnsmasq handles them.
-        # Responses (UDP dst 68) go from the gateway back to devices.
+        # -- 4. DHCP: requests and responses (priority 200) --
         match = parser.OFPMatch(
-            in_port=wifi, eth_type=0x0800, #eth_type=0x0800 = IPv4
-            ip_proto=17, udp_dst=67, #ip_proto=17 = UDP
+            in_port=wifi, eth_type=0x0800,
+            ip_proto=17, udp_dst=67,
         )
         actions = [parser.OFPActionOutput(local)]
         self._add_flow(datapath, PRI_ESSENTIAL, match, actions, tag="dhcp-request")
@@ -399,30 +974,21 @@ class GatewayPolicy(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(wifi)]
         self._add_flow(datapath, PRI_ESSENTIAL, match, actions, tag="dhcp-response")
 
-        # ── 5. DNS: queries and responses (priority 200) ──────
-        # POL-05: DNS is an essential service. Queries go to the
-        # gateway IP (192.168.50.1) which maps to AdGuard Home via
-        # Docker port mapping. Responses come back from the gateway.
-        # Only DNS to the gateway is permitted; direct DNS to external
-        # servers is blocked (and intercepted by nftables DNAT anyway).
-
-        # DNS UDP query
+        # -- 5. DNS: queries and responses (priority 200) --
         match = parser.OFPMatch(
-            in_port=wifi, eth_type=0x0800, #eth_type=0x0800 = IPv4
-            ip_proto=17, udp_dst=53, ipv4_dst=GATEWAY_IP, #ip_proto=17 = UDP
+            in_port=wifi, eth_type=0x0800,
+            ip_proto=17, udp_dst=53, ipv4_dst=GATEWAY_IP,
         )
         actions = [parser.OFPActionOutput(local)]
         self._add_flow(datapath, PRI_ESSENTIAL, match, actions, tag="dns-udp-query")
 
-        # DNS TCP query
         match = parser.OFPMatch(
             in_port=wifi, eth_type=0x0800,
-            ip_proto=6, tcp_dst=53, ipv4_dst=GATEWAY_IP, #ip_proto=6 = TCP
+            ip_proto=6, tcp_dst=53, ipv4_dst=GATEWAY_IP,
         )
         actions = [parser.OFPActionOutput(local)]
         self._add_flow(datapath, PRI_ESSENTIAL, match, actions, tag="dns-tcp-query")
 
-        # DNS UDP response
         match = parser.OFPMatch(
             in_port=local, eth_type=0x0800,
             ip_proto=17, udp_src=53, ipv4_src=GATEWAY_IP,
@@ -430,7 +996,6 @@ class GatewayPolicy(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(wifi)]
         self._add_flow(datapath, PRI_ESSENTIAL, match, actions, tag="dns-udp-response")
 
-        # DNS TCP response
         match = parser.OFPMatch(
             in_port=local, eth_type=0x0800,
             ip_proto=6, tcp_src=53, ipv4_src=GATEWAY_IP,
@@ -438,12 +1003,7 @@ class GatewayPolicy(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(wifi)]
         self._add_flow(datapath, PRI_ESSENTIAL, match, actions, tag="dns-tcp-response")
 
-        # ── 6. NTP: queries and responses (priority 200) ──────
-        # POL-05: NTP is an essential service. IoT devices need
-        # accurate time for TLS certificate validation, scheduled
-        # operations, and logging. For now, UDP 123 to any destination
-        # is allowed. This can be tightened to specific NTP server IPs
-        # in a future hardening pass.
+        # -- 6. NTP: queries and responses (priority 200) --
         match = parser.OFPMatch(
             in_port=wifi, eth_type=0x0800,
             ip_proto=17, udp_dst=123,
@@ -458,34 +1018,18 @@ class GatewayPolicy(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(wifi)]
         self._add_flow(datapath, PRI_ESSENTIAL, match, actions, tag="ntp-response")
 
-        # ── 7. Anti-lateral-movement (priority 150) ───────────
-        # POL-01: Even though the default deny blocks direct
-        # device-to-device frames (which would need WiFi->WiFi
-        # forwarding), a device could try to route traffic to another
-        # IoT device through the gateway. The gateway's IP stack would
-        # see the destination is on the local subnet and forward it.
-        #
-        # This rule catches that case: any IPv4 traffic from the WiFi
-        # port destined for the IoT subnet is dropped. This has lower
-        # priority than the essential services rules, so DHCP/DNS/NTP
-        # to the gateway (192.168.50.1) still works because those
-        # rules match at priority 200 before this rule is evaluated.
+        # -- 7. Anti-lateral-movement (priority 150) --
         match = parser.OFPMatch(
             in_port=wifi, eth_type=0x0800,
             ipv4_dst=(IOT_SUBNET, IOT_SUBNET_MASK),
         )
         self._add_flow(datapath, PRI_ANTI_LATERAL, match, actions=[], tag="anti-lateral")
 
-        # ── 8. General WAN access (priority 50) ──────────────
-        # This permits IoT devices to reach the internet via the
-        # gateway. Traffic from devices goes to LOCAL (the host IP
-        # stack), which NATs it out via enp2s0. Return traffic from
-        # LOCAL goes back to the WiFi port.
-        #
-        # Phase 3 will replace these two rules with per-device
-        # allowlists at priority 500 that restrict each device to
-        # its approved external destinations. Until then, any device
-        # can reach any external IP.
+        # -- 8. General WAN access (priority 50) --
+        # These rules allow any device to reach the internet. In
+        # enforcing mode, profiled devices are intercepted at priority
+        # 100 before these rules are reached. Un-profiled devices
+        # still hit these and get general WAN access.
         match = parser.OFPMatch(in_port=wifi, eth_type=0x0800)
         actions = [parser.OFPActionOutput(local)]
         self._add_flow(datapath, PRI_WAN_ACCESS, match, actions, tag="wan-outbound")
@@ -494,18 +1038,30 @@ class GatewayPolicy(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(wifi)]
         self._add_flow(datapath, PRI_WAN_ACCESS, match, actions, tag="wan-inbound")
 
-        # ── Log Rule Installs ──────────────────────────────────────────────
+        # -- 9. Phase 3: per-device intercept rules (enforcing mode) --
+        # If we are in enforcing mode, install intercept rules for
+        # each profiled device. These sit at priority 100, above the
+        # general WAN rules at 50 but below essential services at 200.
+        enforced_count = 0
+        if self.enforcement_mode == "enforcing":
+            for mac in self.device_profiles:
+                self._install_device_intercept_rules(mac)
+                enforced_count += 1
 
+        # -- Log summary --
         self.rules_installed = True
         LOG.info(
             "Policy rules installed: %d rules. "
             "Micro-segmentation is ACTIVE. "
             "Essential services (DHCP, DNS, NTP) are PERMITTED. "
-            "General WAN access is PERMITTED (Phase 3 will restrict this).",
+            "Mode: %s. Profiled devices: %d. Enforced: %d.",
             self.rule_count,
+            self.enforcement_mode,
+            len(self.device_profiles),
+            enforced_count,
         )
 
-    # ── Helpers ───────────────────────────────────────────────
+    # -- Helpers ------------------------------------------------------------
 
     def _add_flow(self, datapath, priority, match, actions,
                   idle_timeout=0, hard_timeout=0, tag=""):

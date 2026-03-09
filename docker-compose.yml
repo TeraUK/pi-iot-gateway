@@ -11,6 +11,9 @@ services:
       - "6653:6653"
       # REST API — used by Zeek and ML Pipeline for dynamic policy injection
       - "8080:8080"
+    volumes:
+      # Mount the config directory so device_profiles.json can be edited on the host and reloaded via the REST API.
+      - ./ryu/config:/opt/ryu/config:ro
     networks:
       - gateway-net
     # Resource limits per architecture doc estimates

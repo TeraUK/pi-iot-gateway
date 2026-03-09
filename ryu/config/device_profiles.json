@@ -1,0 +1,28 @@
+{
+    "mode": "learning",
+    "idle_timeout": 300,
+    "devices": {
+        "aa:bb:cc:dd:ee:01": {
+            "name": "Example Smart Thermostat",
+            "manufacturer": "ExampleCorp",
+            "allowed_domains": [
+                "api.example-thermostat.com",
+                "telemetry.example-thermostat.com",
+                "firmware.example-thermostat.com",
+                "time.google.com"
+            ],
+            "allowed_cidrs": [
+                "203.0.113.0/24"
+            ]
+        },
+        "aa:bb:cc:dd:ee:02": {
+            "name": "Example Smart Plug",
+            "manufacturer": "ExampleCorp",
+            "allowed_domains": [
+                "cloud.example-plug.com",
+                "ota.example-plug.com"
+            ],
+            "allowed_cidrs": []
+        }
+    }
+}

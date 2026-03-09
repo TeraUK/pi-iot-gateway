@@ -1,0 +1,21 @@
+[Unit]
+Description=IoT Gateway DNS Cache Updater
+Documentation=DNS-Cache-Updater.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/dns_cache_updater.py
+Restart=on-failure
+RestartSec=10
+
+# Environment variables (adjust as needed).
+Environment=ZEEK_CONTAINER=zeek
+Environment=ZEEK_DNS_LOG=/opt/zeek-logs/current/dns.log
+Environment=RYU_API_URL=http://127.0.0.1:8080
+Environment=POLL_INTERVAL=10
+Environment=FULL_REFRESH_INTERVAL=300
+
+[Install]
+WantedBy=multi-user.target

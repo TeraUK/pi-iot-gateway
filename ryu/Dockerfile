@@ -13,11 +13,12 @@ RUN pip install --no-cache-dir \
     requests
 
 # Directory for custom Ryu applications
-RUN mkdir -p /opt/ryu/apps
+RUN mkdir -p /opt/ryu/apps /opt/ryu/config
 WORKDIR /opt/ryu
 
 # Copy custom apps into the image
 COPY apps/ /opt/ryu/apps/
+COPY config/ /opt/ryu/config/
 
 # OpenFlow listener and REST API
 EXPOSE 6653 8080
