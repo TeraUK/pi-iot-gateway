@@ -74,8 +74,8 @@ services:
     volumes:
       # Zeek writes logs here; the ML pipeline reads from here.
       - zeek-logs:/opt/zeek-logs
-      # Custom Zeek scripts
-      - ./zeek/site/local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
+      # Mount the entire site directory (detection scripts + IOCs).
+      - ./zeek/site:/usr/local/zeek/share/zeek/site:ro
       - ./zeek/entrypoint.sh:/opt/zeek-entrypoint/entrypoint.sh:ro
     environment:
       - ZEEK_LOG_DIR=/opt/zeek-logs
