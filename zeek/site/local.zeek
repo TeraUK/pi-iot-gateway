@@ -1,3 +1,10 @@
+#
+# IoT Security Gateway - Zeek Local Policy
+# 
+# This file is loaded automatically by Zeek. It configures protocol
+# analysers, logging, and loads the IoT detection scripts.
+#
+
 # ---- Standard Protocol Analysers ----
 # These generate the structured logs that feed the ML pipeline.
 @load base/protocols/conn
@@ -12,7 +19,7 @@
 
 # SSH and FTP analysis - IoT devices should rarely use these protocols.
 # If an SSH or FTP connection appears in the logs, it is a strong
-# anomaly signal worth investigating (detection scripts willflag this).
+# anomaly signal worth investigating (detection scripts will flag this).
 @load base/protocols/ssh
 @load base/protocols/ftp
 
@@ -30,22 +37,17 @@
 @load policy/protocols/dhcp/software
 
 # ---- Notice Framework ----
-# Detection scripts will use this to generate alerts.
-# For now, notices just get logged.
+# Detection scripts use this for internal notice generation.
 @load base/frameworks/notice
-
-# The drop action allows detection scripts to request that Zeek
-# emit a notice with an action hint. This will be wired to Ryu.
 @load policy/frameworks/notice/actions/drop
 
 # ---- Logging Configuration ----
-# Rotate logs hourly. Zeek will create timestamped archive files
-# and start fresh log files each rotation.
+# Rotate logs hourly. Zeek creates timestamped archive files and
+# starts fresh log files each rotation.
 redef Log::default_rotation_interval = 1 hr;
 
-# Use JSON output instead of Zeek's tab-separated format.
-# JSON is easier for the ML pipeline to parse and is more portable
-# for any future log analysis tools.
+# Use JSON output for all logs. JSON is easier for the ML pipeline
+# to parse and for any future centralized logging system to ingest.
 @load policy/tuning/json-logs
 
 # Reduce noise: suppress the packet filter log and loaded-scripts log.
@@ -54,19 +56,40 @@ redef Log::default_rotation_interval = 1 hr;
 # ---- SSL Certificate Validation ----
 # Flags expired, self-signed, and otherwise invalid certificates.
 # IoT devices often have poor certificate hygiene, so this may be
-# noisy at first. Useful for spotting MITM attempts or devices
-# communicating with suspicious servers.
+# noisy at first.
 @load policy/protocols/ssl/validate-certs
 
 # ---- DNS Query Case Preservation ----
-# Preserves the original capitalisation of DNS query names in dns.log
-# rather than lowercasing everything. Some malware encodes data in the
-# case pattern of DNS labels (a technique used in DNS tunnelling).
-# Having the original case available makes that detectable.
+# Preserves the original capitalisation of DNS query names in dns.log.
+# Some malware encodes data in the case pattern of DNS labels (used
+# in DNS tunnelling). Having the original case makes that detectable.
 @load policy/protocols/dns/log-original-query-case
 
-# ---- Ryu REST API Integration ----
-# Load the ActiveHTTP utility so it is available when I add detection
-# scripts. Those scripts will POST isolation requests to
-# the Ryu REST API at http://ryu:8080/...
+# ---- ActiveHTTP ----
+# Required by the alert framework for POSTing isolation requests
+# to the Ryu REST API.
 @load base/utils/active-http
+
+# ---- IoT Detection Scripts (Phase 4) ----
+# This loads the alert framework and all six detection scripts.
+@load ./iot-detection
+
+# ---- Detection Configuration ----
+# Override detection thresholds and modes here. These redef statements
+# take effect after the scripts are loaded.
+#
+# Auto-isolation is DISABLED by default (dry-run mode). Should be enabled
+# once the detections have been thoroughly tested, and it is confirmed they
+# are not producing false positives.
+#
+# To enable auto-isolation:
+# redef IoT::auto_isolate = T;
+#
+# To switch the baseline-dependent detectors to detection mode:
+# redef IoT::new_dest_mode = "detecting";
+# redef IoT::proto_anomaly_mode = "detecting";
+#
+# To adjust thresholds (examples):
+# redef IoT::port_scan_critical_threshold = 20.0;
+# redef IoT::dns_rate_warning_threshold = 150.0;
+# redef IoT::volume_warning_threshold = 104857600.0;  # 100 MB
