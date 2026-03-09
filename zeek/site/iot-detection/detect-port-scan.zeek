@@ -40,7 +40,7 @@ event zeek_init()
         $reducers = set(r1),
         $threshold_val(key: SumStats::Key, result: SumStats::Result) =
             {
-            return result["iot.port_scan.targets"]$unique;
+            return result["iot.port_scan.targets"]$unique + 0.0;
             },
         $threshold = port_scan_warning_threshold,
         $threshold_crossed(key: SumStats::Key, result: SumStats::Result) =
