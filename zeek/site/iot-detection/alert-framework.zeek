@@ -15,8 +15,9 @@
 @load base/utils/active-http
 @load base/protocols/dhcp
 
-module IoT;
+module IoT; # Tells zeek this script should be in the IoT namespace.
 
+# Items defined in the export block are publically visible to the entire IoT namespace
 export {
     # Severity levels for alerts.
     type Severity: enum {
@@ -42,14 +43,13 @@ export {
         action_taken:  string          &log &default="logged";  #< What action was taken (logged, isolate_requested, dry_run).
     };
 
-    # The Ryu REST API base URL. Zeek reaches Ryu via the Docker
-    # network hostname.
+    # The Ryu REST API base URL. Zeek reaches Ryu via the Docker network hostname.
     option ryu_api_url = "http://ryu:8080";
 
     # When enabled, CRITICAL alerts will trigger automatic device
     # isolation via the Ryu REST API. When disabled, CRITICAL alerts
     # are still logged but no network action is taken (dry-run mode).
-    # I will enable this once I have tested the detections thoroughly.
+    # This should be enabled once the detections have been thoroughly tested.
     option auto_isolate = F;
 
     # The IoT subnet prefix. Only devices with source IPs matching
@@ -68,10 +68,8 @@ export {
                                 dst_port: port &default=0/unknown);
 
     # Request isolation of a device via the Ryu REST API.
-    # Only called internally when auto_isolate is enabled and
-    # severity is CRITICAL.
-    global request_isolation: function(mac: string, ip: addr,
-                                       reason: string);
+    # Only called internally when auto_isolate is enabled and severity is CRITICAL.
+    global request_isolation: function(mac: string, ip: addr, reason: string);
 
     # Resolve an IP address to a MAC address using the DHCP table.
     global ip_to_mac: function(ip: addr): string;
@@ -94,17 +92,13 @@ event zeek_init()
     }
 
 # Populate the IP-to-MAC table from DHCP acknowledgements.
-# Every time dnsmasq hands out a lease, this event fires and I
-# record the mapping. This is the most reliable way to resolve
-# IoT device IPs to MACs inside Zeek.
-event dhcp_ack(c: connection, msg: dhcp_msg, mask: addr, router: dhcp_router_list,
-               dns: dhcp_dns_list)
+# Every time dnsmasq hands out a lease, this event fires and records the mapping. 
+# This is the most reliable way to resolve IoT device IPs to MACs inside Zeek.
+event DHCP::log_dhcp(rec: DHCP::Info)
     {
-    if ( msg?$h_addr && msg?$yiaddr )
+    if ( rec?$mac && rec?$assigned_addr )
         {
-        local mac = msg$h_addr;
-        local ip = msg$yiaddr;
-        IoT::dhcp_table[ip] = mac;
+        IoT::dhcp_table[rec$assigned_addr] = rec$mac;
         }
     }
 
@@ -117,7 +111,7 @@ function ip_to_mac(ip: addr): string
 
 function is_iot_device(ip: addr): bool
     {
-    return (ip in iot_subnet) && (ip != to_addr(gateway_ip));
+    return (ip in iot_subnet) && (ip != gateway_ip);
     }
 
 function emit_alert(severity: Severity, detector: string,
@@ -173,8 +167,7 @@ function emit_alert(severity: Severity, detector: string,
     Log::write(IoT::ALERT_LOG, rec);
     }
 
-function request_isolation(mac: string, ip: addr,
-                            reason: string)
+function request_isolation(mac: string, ip: addr, reason: string)
     {
     local payload = fmt("{\"mac\": \"%s\", \"reason\": \"Zeek: %s (src_ip=%s)\"}", mac, reason, ip);
     local url = fmt("%s/policy/isolate", ryu_api_url);
@@ -186,7 +179,7 @@ function request_isolation(mac: string, ip: addr,
         $addl_curl_args = fmt("-H 'Content-Type: application/json'")
     );
 
-    when [req, mac, ip, reason] ( local resp = ActiveHTTP::request(req) )
+    when [req, mac, ip] ( local resp = ActiveHTTP::request(req) )
         {
         if ( resp$code == 200 )
             Reporter::info(fmt("IoT: Successfully requested isolation of %s (%s)", mac, ip));
