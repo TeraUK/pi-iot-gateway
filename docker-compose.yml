@@ -77,6 +77,13 @@ services:
       # Mount the entire site directory (detection scripts + IOCs).
       - ./zeek/site:/usr/local/zeek/share/zeek/site:ro
       - ./zeek/entrypoint.sh:/opt/zeek-entrypoint/entrypoint.sh:ro
+      # Mounting the entire `site/` directory replaces the default 
+      # contents of `/usr/local/zeek/share/zeek/site/` inside the container.
+      # The default `site/` directory in the Zeek image contains a `local.zeek` that
+      # loads `local-manager.zeek`, `local-worker.zeek`, etc. Since this
+      # `local.zeek` is a complete replacement that loads everything that is needed, this
+      # is fine. But if at anypoint anything from Zeek's default site scripts is needed,
+      # it needs to be copied into the custom `zeek/site/` directory.
     environment:
       - ZEEK_LOG_DIR=/opt/zeek-logs
     # Override the default log directory.
