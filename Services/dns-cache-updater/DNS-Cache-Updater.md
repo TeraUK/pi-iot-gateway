@@ -83,8 +83,8 @@ To change a value, edit the service file:
 sudo systemctl edit dns-cache-updater
 ```
 
-This creates an override file where I can add or replace environment
-variables without modifying the original unit file:
+This creates an override file where the admin can add or replace 
+environment variables without modifying the original unit file:
 
 ```ini
 [Service]
@@ -120,7 +120,7 @@ sudo systemctl disable dns-cache-updater
 
 ## Verifying It Works
 
-After starting the service, I can confirm it is populating the DNS cache
+After starting the service, the user can confirm it is populating the DNS cache
 by querying Ryu:
 
 ```bash
@@ -128,8 +128,8 @@ curl -s http://127.0.0.1:8080/policy/dns-cache | python3 -m json.tool
 ```
 
 If profiles are loaded with `allowed_domains` entries and IoT devices are
-generating DNS traffic, I should see domain-to-IP mappings with recent
-timestamps. If the cache is empty, I check:
+generating DNS traffic, you should see domain-to-IP mappings with recent
+timestamps. If the cache is empty, check:
 
 - The service is running: `sudo systemctl status dns-cache-updater`
 - The Zeek container is running and producing dns.log entries:
@@ -167,6 +167,11 @@ exit code and the service skips that poll cycle. Again, it does not crash.
   means there may be a brief gap where entries from the tail of the
   old file are missed. In practice, the full refresh cycle catches
   these within `FULL_REFRESH_INTERVAL` seconds.
+
+- Reading the entire dns.log file may become resource intensive as it gets 
+  bigger. It may be a better idea so index the logs and record the
+  last seen index value. Aggregating the logs into a database is planned, 
+  at which point this service will be reviewed.
 
 - Only IPv4 addresses are extracted from DNS answer records. IPv6 (AAAA)
   records are ignored, which is consistent with the gateway's IPv4-only
