@@ -4,8 +4,9 @@ IoT Security Gateway — ML Pipeline (Placeholder)
 This script watches for Zeek log files on the shared volume and
 demonstrates the log-consumption and Ryu-integration pattern.
 
-Replace the placeholder analysis with your actual model training
-and inference logic as the project develops.
+Currently a placeholder analysis script that needs replacing.
+
+Just demonstrates how log ingestion and alerting would work.
 """
 
 import os
