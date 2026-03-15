@@ -1,0 +1,105 @@
+# IoT Security Gateway - ML Pipeline Alert Thresholds
+#
+# This file controls how anomaly scores from the Isolation Forest models
+# are mapped to the three severity levels defined in POL-07.
+#
+# Isolation Forest anomaly score convention (as used by this pipeline):
+#   Positive values = anomalous (higher = more anomalous)
+#   Values near 0   = ambiguous
+#   Negative values = normal (lower = more normal)
+#
+# Start conservative (high thresholds) and lower them gradually as you
+# confirm the models are not generating false positives.
+# The recommended workflow:
+#   1. Deploy with AUTO_ISOLATE=false (dry-run mode).
+#   2. Review ml_alerts.log for a week. Identify and tune out false positives.
+#   3. Once false positive rate is acceptable, lower CRITICAL threshold and
+#      enable AUTO_ISOLATE=true in docker-compose.yml.
+
+# ---------------------------------------------------------------------------
+# Isolation Forest score thresholds
+# ---------------------------------------------------------------------------
+# Any device scoring above info_threshold is logged as INFO.
+# Any device scoring above warning_threshold is promoted to WARNING.
+# Any device scoring above critical_threshold is promoted to CRITICAL.
+
+thresholds:
+  info_threshold:     0.05   # Just above the noise floor.
+  warning_threshold:  0.15   # Meaningfully anomalous but uncertain.
+  critical_threshold: 0.30   # High confidence anomaly. Default is conservative.
+
+# ---------------------------------------------------------------------------
+# Rule-based CRITICAL overrides
+# ---------------------------------------------------------------------------
+# These checks run independently of the Isolation Forest score. If any of
+# these conditions are met, the alert is immediately classified as CRITICAL
+# regardless of the model's score.
+#
+# This ensures that specific high-confidence attack signatures (port scanning,
+# extreme volume spikes) always trigger isolation even before a per-device
+# model has been trained.
+
+rules:
+  # Flag as CRITICAL if the device attempted connections to more than this
+  # many unique destination ports in the scoring window.
+  # Mirai scans port 23 (Telnet) and 2323 across many IPs.
+  port_scan_critical_unique_ports: 30
+
+  # Flag as CRITICAL if DNS query count exceeds this multiple of the device's
+  # established baseline mean. Requires baseline_established() == True.
+  # 10x baseline matches the CRITICAL threshold defined in the security policy.
+  dns_rate_critical_multiplier: 10.0
+
+  # Flag as WARNING if DNS query count exceeds this multiple of baseline.
+  dns_rate_warning_multiplier: 2.0
+
+  # Flag as CRITICAL if total bytes in the window exceeds this multiple of
+  # the device's established baseline. Catches DDoS participation.
+  volume_critical_multiplier: 10.0
+
+  # Flag as WARNING if total bytes exceeds this multiple of baseline.
+  volume_warning_multiplier: 3.0
+
+  # Flag as CRITICAL if the failed connection rate exceeds this threshold.
+  # A value of 0.8 means 80% of connections failed (S0 or REJ state).
+  # High failed rate = scanning or blocked C2 beaconing.
+  failed_conn_critical_rate: 0.80
+
+  # Flag as WARNING if failed connection rate exceeds this threshold.
+  failed_conn_warning_rate: 0.50
+
+  # Flag as WARNING if mean DNS query name entropy exceeds this value.
+  # Values above 3.5 are indicative of DGA or DNS tunnelling.
+  dns_entropy_warning: 3.50
+
+  # Flag as CRITICAL if mean DNS query name entropy exceeds this value.
+  dns_entropy_critical: 3.80
+
+# ---------------------------------------------------------------------------
+# Scoring behaviour
+# ---------------------------------------------------------------------------
+
+scoring:
+  # Number of seconds between scoring cycles. The poll loop runs every
+  # POLL_INTERVAL seconds (set in docker-compose.yml); scoring runs every
+  # score_interval seconds. Set this to a multiple of POLL_INTERVAL.
+  # 60 seconds = score once per minute.
+  score_interval: 60
+
+  # Rolling window size in seconds. Entries older than this are discarded
+  # from each device's window before feature extraction.
+  window_seconds: 300
+
+  # Minimum number of scoring cycles a device must have completed before
+  # its baseline is considered established for the rule-based multiplier checks.
+  # 50 cycles at 60s = 50 minutes.
+  min_baseline_observations: 50
+
+  # Minimum number of conn.log entries in the current window to attempt
+  # scoring. Devices with fewer entries than this are skipped to avoid
+  # noisy scores on idle devices.
+  min_conn_entries: 3
+
+  # Alert deduplication: suppress repeated alerts for the same device and
+  # detector type within this many seconds.
+  dedup_seconds: 120

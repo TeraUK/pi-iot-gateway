@@ -110,11 +110,25 @@ services:
       - ryu
       - zeek
     volumes:
-      # Read Zeek's log output
-      - zeek-logs:/opt/zeek-logs:ro
+      # Zeek logs: read-only mount removed so the pipeline can write ml_alerts.log.
+      # The pipeline only writes to ml_alerts.log; all Zeek log files are untouched.
+      - zeek-logs:/opt/zeek-logs
+      # Trained Isolation Forest models (populated by running train/train.py).
+      # Mount as read-only - the pipeline loads but never overwrites models.
+      - ./ml-pipeline/models:/opt/ml-pipeline/models:ro
+      # Alert threshold configuration (thresholds.yml).
+      # Edit on the host and restart the container to apply changes.
+      - ./ml-pipeline/config:/opt/ml-pipeline/config:ro
     environment:
       - RYU_API_URL=http://ryu:8080
       - POLL_INTERVAL=10
+      - ZEEK_LOG_DIR=/opt/zeek-logs
+      - MODELS_DIR=/opt/ml-pipeline/models
+      - CONFIG_PATH=/opt/ml-pipeline/config/thresholds.yml
+      - ML_ALERT_LOG=/opt/zeek-logs/ml_alerts.log
+      # Keep auto-isolation disabled (dry-run mode) until the models have been
+      # validated against real traffic. Set to "true" to enable.
+      - ML_AUTO_ISOLATE=false
     networks:
       - gateway-net
     deploy:

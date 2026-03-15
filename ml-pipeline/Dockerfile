@@ -1,12 +1,13 @@
 FROM python:3.11-slim
 
 # Install ML and data processing dependencies.
-# Staringt lightweight — adingd TensorFlow/PyTorch when model requires it.
 RUN pip install --no-cache-dir \
     pandas \
     scikit-learn \
     numpy \
-    requests
+    requests \
+    pyyaml \
+    joblib
 
 RUN mkdir -p /opt/ml-pipeline
 WORKDIR /opt/ml-pipeline
